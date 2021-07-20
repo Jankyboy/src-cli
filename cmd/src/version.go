@@ -1,18 +1,16 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"flag"
 	"fmt"
 	"io/ioutil"
 	"net/http"
-	"net/url"
-)
 
-// buildTag is the git tag at the time of build and is used to
-// denote the binary's current version. This value is supplied
-// as an ldflag at compile time in travis.
-var buildTag = "dev"
+	"github.com/sourcegraph/src-cli/internal/api"
+	"github.com/sourcegraph/src-cli/internal/version"
+)
 
 func init() {
 	usage := `
@@ -25,19 +23,22 @@ Examples:
 
 	flagSet := flag.NewFlagSet("version", flag.ExitOnError)
 
-	handler := func(args []string) error {
-		fmt.Printf("Current version: %s\n", buildTag)
+	var apiFlags = api.NewFlags(flagSet)
 
-		recommendedVersion, err := getRecommendedVersion()
+	handler := func(args []string) error {
+		fmt.Printf("Current version: %s\n", version.BuildTag)
+
+		client := cfg.apiClient(apiFlags, flagSet.Output())
+		recommendedVersion, err := getRecommendedVersion(context.Background(), client)
 		if err != nil {
 			return err
 		}
 		if recommendedVersion == "" {
-			fmt.Println("Recommended Version: <unknown>")
+			fmt.Println("Recommended version: <unknown>")
 			fmt.Println("This Sourcegraph instance does not support this feature.")
 			return nil
 		}
-		fmt.Printf("Recommended Version: %s\n", recommendedVersion)
+		fmt.Printf("Recommended version: %s or later\n", recommendedVersion)
 		return nil
 	}
 
@@ -53,21 +54,13 @@ Examples:
 	})
 }
 
-func getRecommendedVersion() (string, error) {
-	url, err := url.Parse(cfg.Endpoint + "/.api/src-cli/version")
+func getRecommendedVersion(ctx context.Context, client api.Client) (string, error) {
+	req, err := client.NewHTTPRequest(ctx, "GET", ".api/src-cli/version", nil)
 	if err != nil {
 		return "", err
 	}
 
-	req, err := http.NewRequest("GET", url.String(), nil)
-	if err != nil {
-		return "", err
-	}
-	for k, v := range cfg.AdditionalHeaders {
-		req.Header.Set(k, v)
-	}
-
-	resp, err := http.DefaultClient.Do(req)
+	resp, err := client.Do(req)
 	if err != nil {
 		return "", err
 	}

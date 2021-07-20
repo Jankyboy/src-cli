@@ -4,6 +4,7 @@ package api
 import (
 	"bytes"
 	"context"
+	"crypto/tls"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -12,11 +13,9 @@ import (
 	"os"
 	"strings"
 
-	"github.com/hashicorp/go-multierror"
-	"github.com/jig/teereadcloser"
+	ioaux "github.com/jig/teereadcloser"
 	"github.com/kballard/go-shellquote"
 	"github.com/mattn/go-isatty"
-	"github.com/pkg/errors"
 )
 
 // Client instances provide methods to create API requests.
@@ -28,11 +27,21 @@ type Client interface {
 	// NewRequest creates a GraphQL request.
 	NewRequest(query string, vars map[string]interface{}) Request
 
+	// NewGzippedRequest creates a GraphQL request with gzip compression turned on.
+	NewGzippedRequest(query string, vars map[string]interface{}) Request
+
+	// NewGzippedQuery is a convenience wrapper around NewQuery with gzip
+	// compression turned on.
+	NewGzippedQuery(query string) Request
+
 	// NewHTTPRequest creates an http.Request for the Sourcegraph API.
 	//
 	// path is joined against the API route. For example on Sourcegraph.com this
 	// will result the URL: https://sourcegraph.com/.api/path.
 	NewHTTPRequest(ctx context.Context, method, path string, body io.Reader) (*http.Request, error)
+
+	// Do runs an http.Request against the Sourcegraph API.
+	Do(req *http.Request) (*http.Response, error)
 }
 
 // Request instances represent GraphQL requests.
@@ -53,7 +62,8 @@ type Request interface {
 
 // client is the internal concrete type implementing Client.
 type client struct {
-	opts ClientOpts
+	opts       ClientOpts
+	httpClient *http.Client
 }
 
 // request is the internal concrete type implementing Request.
@@ -61,6 +71,7 @@ type request struct {
 	client *client
 	query  string
 	vars   map[string]interface{}
+	gzip   bool
 }
 
 // ClientOpts encapsulates the options given to NewClient.
@@ -89,6 +100,13 @@ func NewClient(opts ClientOpts) Client {
 		flags = defaultFlags()
 	}
 
+	httpClient := http.DefaultClient
+	if flags.insecureSkipVerify != nil && *flags.insecureSkipVerify {
+		httpClient = &http.Client{
+			Transport: &http.Transport{TLSClientConfig: &tls.Config{InsecureSkipVerify: true}},
+		}
+	}
+
 	return &client{
 		opts: ClientOpts{
 			Endpoint:          opts.Endpoint,
@@ -97,6 +115,7 @@ func NewClient(opts ClientOpts) Client {
 			Flags:             flags,
 			Out:               opts.Out,
 		},
+		httpClient: httpClient,
 	}
 }
 
@@ -112,7 +131,33 @@ func (c *client) NewRequest(query string, vars map[string]interface{}) Request {
 	}
 }
 
+func (c *client) NewGzippedRequest(query string, vars map[string]interface{}) Request {
+	return &request{
+		client: c,
+		query:  query,
+		vars:   vars,
+		gzip:   true,
+	}
+}
+
+func (c *client) NewGzippedQuery(query string) Request {
+	return c.NewGzippedRequest(query, nil)
+}
+
+func (c *client) Do(req *http.Request) (*http.Response, error) {
+	return c.httpClient.Do(req)
+}
+
 func (c *client) NewHTTPRequest(ctx context.Context, method, p string, body io.Reader) (*http.Request, error) {
+	req, err := c.createHTTPRequest(ctx, method, p, body)
+	if err != nil {
+		return nil, err
+	}
+
+	return req, nil
+}
+
+func (c *client) createHTTPRequest(ctx context.Context, method, p string, body io.Reader) (*http.Request, error) {
 	req, err := http.NewRequestWithContext(ctx, method, strings.TrimRight(c.opts.Endpoint, "/")+"/"+p, body)
 	if err != nil {
 		return nil, err
@@ -126,6 +171,7 @@ func (c *client) NewHTTPRequest(ctx context.Context, method, p string, body io.R
 	for k, v := range c.opts.AdditionalHeaders {
 		req.Header.Set(k, v)
 	}
+
 	return req, nil
 }
 
@@ -135,8 +181,8 @@ func (r *request) do(ctx context.Context, result interface{}) (bool, error) {
 		if err != nil {
 			return false, err
 		}
-		r.client.opts.Out.Write([]byte(curl + "\n"))
-		return false, nil
+		_, err = r.client.opts.Out.Write([]byte(curl + "\n"))
+		return false, err
 	}
 
 	if *r.client.opts.Flags.dump {
@@ -163,14 +209,23 @@ func (r *request) do(ctx context.Context, result interface{}) (bool, error) {
 		return false, err
 	}
 
+	var bufBody io.Reader = bytes.NewBuffer(reqBody)
+	if r.gzip {
+		bufBody = gzipReader(bufBody)
+	}
+
 	// Create the HTTP request.
-	req, err := r.client.NewHTTPRequest(ctx, "POST", ".api/graphql", bytes.NewBuffer(reqBody))
+	req, err := r.client.NewHTTPRequest(ctx, "POST", ".api/graphql", bufBody)
 	if err != nil {
 		return false, err
 	}
 
+	if r.gzip {
+		req.Header.Set("Content-Encoding", "gzip")
+	}
+
 	// Perform the request.
-	resp, err := http.DefaultClient.Do(req)
+	resp, err := r.client.httpClient.Do(req)
 	if err != nil {
 		return false, err
 	}
@@ -178,7 +233,10 @@ func (r *request) do(ctx context.Context, result interface{}) (bool, error) {
 
 	// Check trace header before we potentially early exit
 	if *r.client.opts.Flags.trace {
-		r.client.opts.Out.Write([]byte(fmt.Sprintf("x-trace: %s\n", resp.Header.Get("x-trace"))))
+		_, err := r.client.opts.Out.Write([]byte(fmt.Sprintf("x-trace: %s\n", resp.Header.Get("x-trace"))))
+		if err != nil {
+			return false, err
+		}
 	}
 
 	// Our request may have failed before reaching the GraphQL endpoint, so
@@ -203,7 +261,7 @@ func (r *request) do(ctx context.Context, result interface{}) (bool, error) {
 		body = ioaux.TeeReadCloser(resp.Body, &buf)
 		defer func() {
 			var out bytes.Buffer
-			json.Indent(&out, buf.Bytes(), "    ", "    ")
+			_ = json.Indent(&out, buf.Bytes(), "    ", "    ")
 			fmt.Fprintf(r.client.opts.Out, "--> %s\n\n", out.String())
 		}()
 	}
@@ -216,6 +274,10 @@ func (r *request) do(ctx context.Context, result interface{}) (bool, error) {
 	return true, nil
 }
 
+// Do executes the request. Successful requests will be unmarshalled into the
+// given result. If GraphQL errors are returned, then the returned error will be
+// an instance of GraphQlErrors. Other errors (such as HTTP or network errors)
+// will be returned as-is.
 func (r *request) Do(ctx context.Context, result interface{}) (bool, error) {
 	raw := rawResult{Data: result}
 	ok, err := r.do(ctx, &raw)
@@ -227,11 +289,11 @@ func (r *request) Do(ctx context.Context, result interface{}) (bool, error) {
 
 	// Handle the case of unpacking errors.
 	if raw.Errors != nil {
-		var errs *multierror.Error
+		errs := GraphQlErrors{}
 		for _, err := range raw.Errors {
-			errs = multierror.Append(errs, &graphqlError{err})
+			errs = append(errs, &GraphQlError{err})
 		}
-		return false, errors.Wrap(errs, "GraphQL errors")
+		return false, errs
 	}
 	return true, nil
 }

@@ -17,6 +17,7 @@ import (
 
 	isatty "github.com/mattn/go-isatty"
 	"github.com/sourcegraph/src-cli/internal/api"
+	"github.com/sourcegraph/src-cli/internal/streaming"
 	"jaytaylor.com/html2text"
 )
 
@@ -50,14 +51,28 @@ Other tips:
 
 	flagSet := flag.NewFlagSet("search", flag.ExitOnError)
 	var (
-		jsonFlag        = flagSet.Bool("json", false, "Whether or not to output results as JSON")
+		jsonFlag        = flagSet.Bool("json", false, "Whether or not to output results as JSON.")
 		explainJSONFlag = flagSet.Bool("explain-json", false, "Explain the JSON output schema and exit.")
 		apiFlags        = api.NewFlags(flagSet)
-		lessFlag        = flagSet.Bool("less", true, "Pipe output to 'less -R' (only if stdout is terminal, and not json flag)")
+		lessFlag        = flagSet.Bool("less", true, "Pipe output to 'less -R' (only if stdout is terminal, and not json flag).")
+		streamFlag      = flagSet.Bool("stream", false, "Consume results as stream. Streaming search only supports a subset of flags and parameters: trace, insecure-skip-verify, display, json.")
+		display         = flagSet.Int("display", -1, "Limit the number of results that are displayed. Only supported together with stream flag. Statistics continue to report all results.")
 	)
 
 	handler := func(args []string) error {
-		flagSet.Parse(args)
+		if err := flagSet.Parse(args); err != nil {
+			return err
+		}
+
+		if *streamFlag {
+			opts := streaming.Opts{
+				Display: *display,
+				Trace:   apiFlags.Trace(),
+				Json:    *jsonFlag,
+			}
+			client := cfg.apiClient(apiFlags, flagSet.Output())
+			return streamSearch(flagSet.Arg(0), opts, client, os.Stdout)
+		}
 
 		if *explainJSONFlag {
 			fmt.Println(searchJSONExplanation)
@@ -509,9 +524,7 @@ var searchTemplateFuncs = map[string]interface{}{
 	"searchHighlightPreview": func(preview interface{}) string {
 		return searchHighlightPreview(preview, "", "")
 	},
-	"searchHighlightDiffPreview": func(diffPreview interface{}) string {
-		return searchHighlightDiffPreview(diffPreview)
-	},
+	"searchHighlightDiffPreview": searchHighlightDiffPreview,
 	"searchMaxRepoNameLength": func(results []map[string]interface{}) int {
 		max := 0
 		for _, r := range results {
@@ -524,12 +537,8 @@ var searchTemplateFuncs = map[string]interface{}{
 		}
 		return max
 	},
-	"htmlToPlainText": func(input string) string {
-		return htmlToPlainText(input)
-	},
-	"buildVersionHasNewSearchInterface": func(input string) bool {
-		return buildVersionHasNewSearchInterface(input)
-	},
+	"htmlToPlainText":                   htmlToPlainText,
+	"buildVersionHasNewSearchInterface": buildVersionHasNewSearchInterface,
 	"renderResult": func(searchResult map[string]interface{}) string {
 		searchResultBody := searchResult["body"].(map[string]interface{})
 		html := searchResultBody["html"].(string)

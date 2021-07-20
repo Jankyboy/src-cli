@@ -12,7 +12,7 @@ builds:
   main: ./cmd/src/
   binary: src
   ldflags:
-    - -X main.buildTag={{.Version}}
+    - -X github.com/sourcegraph/src-cli/internal/version.BuildTag={{.Version}}
   goos:
     - linux
     - windows
@@ -31,15 +31,18 @@ brews:
     name: src-cli
     homepage: "https://sourcegraph.com/"
     description: "Sourcegraph CLI"
-    github:
+    tap:
       owner: sourcegraph
       name: homebrew-src-cli
     # Folder inside the repository to put the formula.
     # Default is the root folder.
     folder: Formula
+    # We need to set this so that goreleaser doesn't think the binary is called
+    # `src-cli`
+    install: |
+      bin.install "src"
 dockers:
-  - binaries:
-    - src
+  - dockerfile: Dockerfile.release
     image_templates:
     - "sourcegraph/src-cli:{{ .Tag }}"
     - "sourcegraph/src-cli:{{ .Major }}"

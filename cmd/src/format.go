@@ -3,7 +3,6 @@ package main
 import (
 	"encoding/json"
 	"fmt"
-	"net/url"
 	"os"
 	"strings"
 	"text/template"
@@ -61,6 +60,9 @@ func parseTemplate(text string) (*template.Template, error) {
 		"addFloat": func(x, y float64) float64 {
 			return x + y
 		},
+		"addInt32": func(x, y int32) int32 {
+			return x + y
+		},
 		"debug": func(v interface{}) string {
 			data, _ := marshalIndent(v)
 			fmt.Println(string(data))
@@ -92,6 +94,13 @@ func parseTemplate(text string) (*template.Template, error) {
 		"buildVersionHasNewSearchInterface": searchTemplateFuncs["buildVersionHasNewSearchInterface"],
 		"renderResult":                      searchTemplateFuncs["renderResult"],
 
+		// Register stream-search specific template functions.
+		"streamSearchSequentialLineNumber": streamSearchTemplateFuncs["streamSearchSequentialLineNumber"],
+		"streamSearchHighlightMatch":       streamSearchTemplateFuncs["streamSearchHighlightMatch"],
+		"streamSearchHighlightCommit":      streamSearchTemplateFuncs["streamSearchHighlightCommit"],
+		"streamSearchRenderCommitLabel":    streamSearchTemplateFuncs["streamSearchRenderCommitLabel"],
+		"matchOrMatches":                   streamSearchTemplateFuncs["matchOrMatches"],
+
 		// Alert rendering
 		"searchAlertRender": func(alert searchResultsAlert) string {
 			if content, err := alert.Render(); err != nil {
@@ -116,18 +125,4 @@ func execTemplate(tmpl *template.Template, data interface{}) error {
 // json.MarshalIndent, but with defaults.
 func marshalIndent(v interface{}) ([]byte, error) {
 	return json.MarshalIndent(v, "", "  ")
-}
-
-func resolveURL(endpoint, u string) (string, error) {
-	parsed, err := url.Parse(u)
-	if err != nil {
-		return "", err
-	}
-
-	base, err := url.Parse(endpoint)
-	if err != nil {
-		return "", err
-	}
-
-	return base.ResolveReference(parsed).String(), nil
 }
